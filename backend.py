@@ -8,6 +8,9 @@ from typing import Dict, List, Any
 from sqlalchemy import create_engine
 from urllib.parse import quote_plus
 
+# --- IMPORT YOUR NEW MODULE ---
+from spacy_model import PiiSpacyAnalyzer
+
 # --- GOOGLE DRIVE IMPORTS ---
 try:
     from googleapiclient.discovery import build
@@ -26,6 +29,14 @@ except ImportError:
     MONGO_AVAILABLE = False
     print("PyMongo not installed. MongoDB features will fail.")
 
+# --- PARQUET IMPORT ---
+try:
+    import pyarrow
+    PARQUET_AVAILABLE = True
+except ImportError:
+    PARQUET_AVAILABLE = False
+    print("PyArrow not installed. Parquet features will fail.")
+
 # --- NLTK SETUP ---
 try:
     nltk.data.find('tokenizers/punkt')
@@ -41,7 +52,8 @@ class RegexClassifier:
         self.colors = {
             "EMAIL": (136, 238, 255), "FIRST_NAME": (170, 255, 170), "LAST_NAME": (170, 255, 170),
             "PHONE": (255, 170, 170), "SSN": (255, 204, 170), "CREDIT_CARD": (255, 238, 170),
-            "LOCATION": (200, 170, 255), "AADHAAR_IND": (255, 150, 255), "DEFAULT": (224, 224, 224)
+            "LOCATION": (200, 170, 255), "AADHAAR_IND": (255, 150, 255), "ORG": (255, 255, 150), 
+            "DEFAULT": (224, 224, 224)
         }
         
         self.patterns: Dict[str, str] = {
@@ -52,6 +64,10 @@ class RegexClassifier:
             "AADHAAR_IND": r"\b\d{4}[ -]?\d{4}[ -]?\d{4}\b",
             "PAN_IND": r"\b[A-Z]{5}\d{4}[A-Z]{1}\b",
         }
+
+        # --- INITIALIZE SPACY MODULE ---
+        # The logic is now handled entirely inside spacy_model.py
+        self.spacy_analyzer = PiiSpacyAnalyzer()
 
     def list_patterns(self): return self.patterns
     def add_pattern(self, n, r): self.patterns[n.upper()] = r
@@ -76,13 +92,38 @@ class RegexClassifier:
         return detections
 
     def analyze_text_hybrid(self, text: str) -> List[dict]:
+        """Combines Regex, NLTK, and SpaCy results."""
         all_matches = []
+        
+        # 1. Regex Scan
         for label, regex in self.patterns.items():
             for match in re.finditer(regex, text):
                 all_matches.append({"label": label, "text": match.group(), "start": match.start(), "end": match.end()})
+        
+        # 2. NLTK Scan
         all_matches.extend(self.scan_with_nltk(text))
+        
+        # 3. SpaCy Scan (Using the new module)
+        # Simply call the .scan() method of your new class
+        all_matches.extend(self.spacy_analyzer.scan(text))
+        
+        # Sort and Dedup (Logic remains the same)
         all_matches.sort(key=lambda x: x['start'])
-        return all_matches
+        
+        unique_matches = []
+        if not all_matches: return []
+        
+        curr = all_matches[0]
+        for next_match in all_matches[1:]:
+            if next_match['start'] < curr['end']:
+                if len(next_match['text']) > len(curr['text']):
+                    curr = next_match
+            else:
+                unique_matches.append(curr)
+                curr = next_match
+        unique_matches.append(curr)
+        
+        return unique_matches
 
     # --- 2. SUMMARY COUNTS ---
     def get_pii_counts(self, text: str) -> pd.DataFrame:
@@ -108,17 +149,12 @@ class RegexClassifier:
         return text
 
     def mask_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: Ensure robust type handling for lists/arrays in cells
         def safe_mask(val):
-            if val is None: return ""
-            # If it's a list or dict, convert to string first
-            if isinstance(val, (list, dict, tuple)):
+            if isinstance(val, (list, dict, tuple, set)):
                 return self.mask_pii(str(val))
-            # If it's empty string
-            if str(val).strip() == "": return val
-            
+            if pd.isna(val): 
+                return val
             return self.mask_pii(str(val))
-
         return df.map(safe_mask)
 
     def get_labeled_pdf_image(self, file_bytes, page_num: int):
@@ -142,7 +178,7 @@ class RegexClassifier:
             text = str(text)
             matches = self.analyze_text_hybrid(text)
             matches.sort(key=lambda x: x['start'], reverse=True)
-            hex_map = {"EMAIL": "#8ef", "PHONE": "#faa", "SSN": "#fca", "CREDIT_CARD": "#fea", "FIRST_NAME": "#af9", "LAST_NAME": "#af9", "LOCATION": "#dcf", "AADHAAR_IND": "#f9f", "DEFAULT": "#e0e0e0"}
+            hex_map = {"EMAIL": "#8ef", "PHONE": "#faa", "SSN": "#fca", "CREDIT_CARD": "#fea", "FIRST_NAME": "#af9", "LAST_NAME": "#af9", "LOCATION": "#dcf", "AADHAAR_IND": "#f9f", "ORG": "#ffecb3", "DEFAULT": "#e0e0e0"}
             for m in matches:
                 if "<span" in text[m['start']:m['end']]: continue
                 color = hex_map.get(m['label'], "#e0e0e0")
@@ -150,10 +186,26 @@ class RegexClassifier:
                 text = text[:m['start']] + tag + text[m['end']:]
             return text
         
-        # Apply safely to all cells
-        return df.map(lambda x: highlight_html(x))
+        def safe_highlight(val):
+             if isinstance(val, (list, dict)): return highlight_html(str(val))
+             if pd.isna(val): return val
+             return highlight_html(val)
 
-    # --- 4. CONNECTORS (SQL) ---
+        return df.map(safe_highlight)
+
+    # --- 4. SCHEMA DETECTION ---
+    def get_data_schema(self, df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty: return pd.DataFrame(columns=["Column", "Type", "Sample"])
+        schema_info = []
+        for col in df.columns:
+            d_type = str(df[col].dtype)
+            first_valid_idx = df[col].first_valid_index()
+            sample_val = str(df[col].loc[first_valid_idx]) if first_valid_idx is not None else "All Null"
+            if len(sample_val) > 50: sample_val = sample_val[:47] + "..."
+            schema_info.append({"Column Name": col, "Data Type": d_type, "Sample Value": sample_val})
+        return pd.DataFrame(schema_info)
+
+    # --- 5. CONNECTORS (SQL) ---
     def get_postgres_data(self, host, port, db, user, pw, table):
         safe_pw = quote_plus(pw)
         conn_str = f"postgresql://{user}:{safe_pw}@{host}:{port}/{db}"
@@ -166,7 +218,7 @@ class RegexClassifier:
         engine = create_engine(conn_str)
         return pd.read_sql(f"SELECT * FROM {table} LIMIT 100", engine)
 
-    # --- 5. NEW: MONGODB CONNECTOR ---
+    # --- 6. MONGODB CONNECTOR ---
     def get_mongodb_data(self, host, port, db, user, pw, collection):
         if not MONGO_AVAILABLE: return pd.DataFrame()
         try:
@@ -176,26 +228,20 @@ class RegexClassifier:
                 uri = f"mongodb://{safe_user}:{safe_pw}@{host}:{port}/"
             else:
                 uri = f"mongodb://{host}:{port}/"
-            
             client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=5000)
             database = client[db]
             col = database[collection]
-            
             cursor = col.find().limit(100)
             data_list = list(cursor)
-            
             if not data_list: return pd.DataFrame()
-            
             for doc in data_list:
                 if '_id' in doc: doc['_id'] = str(doc['_id'])
-            
             return pd.json_normalize(data_list)
-            
         except Exception as e:
             print(f"Mongo Error: {e}")
             raise e
 
-    # --- 6. DRIVE CONNECTOR ---
+    # --- 7. DRIVE CONNECTOR ---
     def get_google_drive_files(self, credentials_dict):
         if not GOOGLE_AVAILABLE: return []
         try:
@@ -213,12 +259,10 @@ class RegexClassifier:
             SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
             creds = service_account.Credentials.from_service_account_info(credentials_dict, scopes=SCOPES)
             service = build('drive', 'v3', credentials=creds)
-            
             if "spreadsheet" in mime_type: request = service.files().export_media(fileId=file_id, mimeType='text/csv')
             elif "document" in mime_type: request = service.files().export_media(fileId=file_id, mimeType='application/pdf')
             elif "presentation" in mime_type: request = service.files().export_media(fileId=file_id, mimeType='application/pdf')
             else: request = service.files().get_media(fileId=file_id)
-
             fh = io.BytesIO()
             downloader = MediaIoBaseDownload(fh, request)
             done = False
@@ -226,6 +270,7 @@ class RegexClassifier:
             return fh.getvalue()
         except: return b""
 
+    # --- 8. FILE READERS ---
     def get_json_data(self, file_obj) -> pd.DataFrame:
         data = json.load(file_obj)
         flat = []
@@ -237,6 +282,14 @@ class RegexClassifier:
             else: flat.append({"Path": path, "Value": str(d)})
         recursive(data, "")
         return pd.DataFrame(flat)
+
+    def get_parquet_data(self, file_bytes) -> pd.DataFrame:
+        if not PARQUET_AVAILABLE: return pd.DataFrame()
+        try:
+            return pd.read_parquet(io.BytesIO(file_bytes))
+        except Exception as e:
+            print(f"Parquet Read Error: {e}")
+            return pd.DataFrame()
 
     def get_pdf_total_pages(self, file_bytes) -> int:
         try:

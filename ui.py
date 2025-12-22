@@ -1,3 +1,4 @@
+# ui.py
 import streamlit as st
 import pandas as pd
 import json
@@ -20,10 +21,10 @@ def main():
     with st.sidebar:
         st.header("1. Source Selection")
         
-        # UPDATE: Split Databases into two categories
         category = st.selectbox("Select Category", 
             [
-                "Traditional Sources", 
+                "UnStructured Data", 
+                "Structured Data",
                 "Relational Databases", 
                 "Non-Relational Databases", 
                 "Cloud Storage"
@@ -33,35 +34,27 @@ def main():
         source = None
         file_sub_type = None
 
-        # 1. TRADITIONAL SOURCES
-        if category == "Traditional Sources":
-            file_sub_type = st.radio("Select File Format", ["PDF Document", "CSV Spreadsheet", "JSON Data"])
+        # 1. UNSTRUCTURED 
+        if category == "UnStructured Data":
+            file_sub_type = st.radio("Filter", ["PDF"])
+            source = "File Upload"
+
+        # 2. STRUCTURED DATA (New Category)
+        elif category == "Structured Data":
+            file_sub_type = st.radio("Filter", ["CSV", "JSON", "Parquet"])
             source = "File Upload"
         
-        # 2. RELATIONAL DATABASES (SQL)
+        # 3. RELATIONAL DATABASES (SQL)
         elif category == "Relational Databases":
-            db_icons = {
-                "PostgreSQL": "🐘 PostgreSQL", 
-                "MySQL": "🐬 MySQL"
-            }
-            source = st.selectbox(
-                "Database Type", 
-                options=["PostgreSQL", "MySQL"], 
-                format_func=lambda x: db_icons.get(x)
-            )
+            db_icons = {"PostgreSQL": "🐘 PostgreSQL", "MySQL": "🐬 MySQL"}
+            source = st.selectbox("Database Type", ["PostgreSQL", "MySQL"], format_func=lambda x: db_icons.get(x))
         
-        # 3. NON-RELATIONAL DATABASES (NoSQL)
+        # 4. NON-RELATIONAL DATABASES (NoSQL)
         elif category == "Non-Relational Databases":
-            db_icons = {
-                "MongoDB": "🍃 MongoDB"
-            }
-            source = st.selectbox(
-                "Database Type", 
-                options=["MongoDB"], 
-                format_func=lambda x: db_icons.get(x)
-            )
+            db_icons = {"MongoDB": "🍃 MongoDB"}
+            source = st.selectbox("Database Type", ["MongoDB"], format_func=lambda x: db_icons.get(x))
         
-        # 4. CLOUD STORAGE
+        # 5. CLOUD STORAGE
         elif category == "Cloud Storage":
             source = st.selectbox("Service", ["Google Drive"])
 
@@ -97,8 +90,16 @@ def main():
         st.divider()
 
     # --- HELPER: ANALYTICS DASHBOARD ---
-    def render_analytics(count_df):
-        st.markdown("### 📊 Analytics Dashboard")
+    def render_analytics(count_df, source_df=None):
+        """Displays PII Pie Chart + SCHEMA INFO"""
+        if source_df is not None and not source_df.empty:
+            st.markdown("### 🧬 Data Schema Detected")
+            with st.expander("View Column Types & Samples", expanded=False):
+                schema_df = classifier.get_data_schema(source_df)
+                st.dataframe(schema_df, use_container_width=True, hide_index=True)
+            st.divider()
+
+        st.markdown("### 📊 PII Analytics")
         if count_df.empty:
             st.info("No PII data detected to visualize.")
             return
@@ -115,10 +116,16 @@ def main():
 
     # --- MAIN LOGIC ---
 
-    # A. TRADITIONAL SOURCES
+    # A. FILE UPLOADS (Both Traditional and Structured)
     if source == "File Upload":
-        ext_map = {"PDF Document": ["pdf"], "CSV Spreadsheet": ["csv"], "JSON Data": ["json"]}
-        accepted_exts = ext_map[file_sub_type]
+        # Map friendly name to extensions
+        ext_map = {
+            "PDF": ["pdf"], 
+            "CSV": ["csv"], 
+            "JSON": ["json"], 
+            "Parquet": ["parquet", "pqt"]
+        }
+        accepted_exts = ext_map.get(file_sub_type, [])
         
         st.subheader(f"📂 {file_sub_type} Analysis")
         uploaded_file = st.file_uploader(f"Upload {file_sub_type}", type=accepted_exts)
@@ -127,11 +134,12 @@ def main():
             file_type = uploaded_file.name.split('.')[-1].lower()
             mask_mode = st.checkbox("🔒 Enable PII Masking")
 
+            # 1. PDF
             if file_type == 'pdf':
                 file_bytes = uploaded_file.getvalue()
                 current_text = classifier.get_pdf_page_text(file_bytes, st.session_state.page_number)
                 count_df = classifier.get_pii_counts(current_text)
-                render_analytics(count_df)
+                render_analytics(count_df, None)
                 
                 total_pages = classifier.get_pdf_total_pages(file_bytes)
                 c1, c2, c3 = st.columns([1, 2, 1])
@@ -145,10 +153,22 @@ def main():
                 img_data = classifier.get_labeled_pdf_image(file_bytes, st.session_state.page_number)
                 if img_data: st.image(img_data, use_container_width=True)
 
+            # 2. PARQUET (NEW)
+            elif file_type in ['parquet', 'pqt']:
+                df = classifier.get_parquet_data(uploaded_file.getvalue())
+                render_analytics(classifier.get_pii_counts_dataframe(df), df)
+                if mask_mode: 
+                    st.success("Data Masked: All PII replaced with ******")
+                    st.dataframe(classifier.mask_dataframe(df).head(50))
+                else: 
+                    st.markdown(classifier.scan_dataframe_with_html(df.head(50)).to_html(escape=False), unsafe_allow_html=True)
+
+            # 3. CSV/JSON
             elif file_type in ['csv', 'json']:
                 if file_type == 'csv': df = pd.read_csv(uploaded_file)
                 else: df = classifier.get_json_data(uploaded_file)
-                render_analytics(classifier.get_pii_counts_dataframe(df))
+                
+                render_analytics(classifier.get_pii_counts_dataframe(df), df)
                 
                 if mask_mode: 
                     st.success("Data Masked: All PII replaced with ******")
@@ -156,7 +176,7 @@ def main():
                 else: 
                     st.markdown(classifier.scan_dataframe_with_html(df.head(50)).to_html(escape=False), unsafe_allow_html=True)
 
-    # B. RELATIONAL DATABASES (SQL)
+    # B. RELATIONAL DATABASES
     elif category == "Relational Databases":
         db_logos = {
             "PostgreSQL": "https://upload.wikimedia.org/wikipedia/commons/2/29/Postgresql_elephant.svg",
@@ -186,7 +206,7 @@ def main():
                 st.warning("Database connected but returned no records.")
             else:
                 count_df = classifier.get_pii_counts_dataframe(df)
-                render_analytics(count_df)
+                render_analytics(count_df, df)
                 mask_mode = st.checkbox("🔒 Mask PII Results")
                 if mask_mode: 
                     st.success("Data Masked")
@@ -194,7 +214,7 @@ def main():
                 else: 
                     st.markdown(classifier.scan_dataframe_with_html(df).to_html(escape=False), unsafe_allow_html=True)
 
-    # C. NON-RELATIONAL DATABASES (NoSQL)
+    # C. NON-RELATIONAL DATABASES
     elif category == "Non-Relational Databases":
         render_source_header("Connect to MongoDB", "https://upload.wikimedia.org/wikipedia/commons/9/93/MongoDB_Logo.svg")
 
@@ -219,7 +239,7 @@ def main():
                 st.warning("Collection empty or connection failed.")
             else:
                 count_df = classifier.get_pii_counts_dataframe(df)
-                render_analytics(count_df)
+                render_analytics(count_df, df)
                 mask_mode = st.checkbox("🔒 Mask PII Results")
                 if mask_mode: 
                     st.success("Data Masked")
@@ -269,17 +289,17 @@ def main():
 
                         if is_pdf:
                             text = classifier.get_pdf_page_text(content, 0)
-                            render_analytics(classifier.get_pii_counts(text))
+                            render_analytics(classifier.get_pii_counts(text), None)
                             img = classifier.get_labeled_pdf_image(content, 0)
                             if img: st.image(img, caption="Page 1 Preview")
                         elif is_csv:
                             df = pd.read_csv(io.BytesIO(content))
-                            render_analytics(classifier.get_pii_counts_dataframe(df))
+                            render_analytics(classifier.get_pii_counts_dataframe(df), df)
                             if mask_mode: st.dataframe(classifier.mask_dataframe(df))
                             else: st.markdown(classifier.scan_dataframe_with_html(df).to_html(escape=False), unsafe_allow_html=True)
                         elif is_json:
                             df = classifier.get_json_data(io.BytesIO(content))
-                            render_analytics(classifier.get_pii_counts_dataframe(df))
+                            render_analytics(classifier.get_pii_counts_dataframe(df), df)
                             if mask_mode: st.dataframe(classifier.mask_dataframe(df))
                             else: st.markdown(classifier.scan_dataframe_with_html(df).to_html(escape=False), unsafe_allow_html=True)
 

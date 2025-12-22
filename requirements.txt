@@ -9,3 +9,5 @@ pymysql
 plotly
 sqlalchemy
 pymongo
+pyarrow
+spacy
