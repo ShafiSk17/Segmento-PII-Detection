@@ -11,3 +11,4 @@ sqlalchemy
 pymongo
 pyarrow
 spacy
+boto3

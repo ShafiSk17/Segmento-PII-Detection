@@ -1,3 +1,4 @@
+# backend.py
 import re
 import json
 import pandas as pd
@@ -8,10 +9,11 @@ from typing import Dict, List, Any
 from sqlalchemy import create_engine
 from urllib.parse import quote_plus
 
-# --- IMPORT YOUR NEW MODULE ---
+# --- IMPORT MODULES ---
 from spacy_model import PiiSpacyAnalyzer
+from inspector import ModelInspector
 
-# --- GOOGLE DRIVE IMPORTS ---
+# --- DEPENDENCY CHECKS ---
 try:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseDownload
@@ -19,23 +21,30 @@ try:
     GOOGLE_AVAILABLE = True
 except ImportError:
     GOOGLE_AVAILABLE = False
-    print("Google Libraries not installed. Drive features will fail.")
+    print("Google Libraries not installed.")
 
-# --- MONGODB IMPORT ---
 try:
     import pymongo
     MONGO_AVAILABLE = True
 except ImportError:
     MONGO_AVAILABLE = False
-    print("PyMongo not installed. MongoDB features will fail.")
+    print("PyMongo not installed.")
 
-# --- PARQUET IMPORT ---
 try:
     import pyarrow
     PARQUET_AVAILABLE = True
 except ImportError:
     PARQUET_AVAILABLE = False
-    print("PyArrow not installed. Parquet features will fail.")
+    print("PyArrow not installed.")
+
+# --- AWS S3 IMPORT (NEW) ---
+try:
+    import boto3
+    from botocore.exceptions import NoCredentialsError, ClientError
+    AWS_AVAILABLE = True
+except ImportError:
+    AWS_AVAILABLE = False
+    print("Boto3 not installed. AWS S3 features will fail.")
 
 # --- NLTK SETUP ---
 try:
@@ -65,15 +74,22 @@ class RegexClassifier:
             "PAN_IND": r"\b[A-Z]{5}\d{4}[A-Z]{1}\b",
         }
 
-        # --- INITIALIZE SPACY MODULE ---
-        # The logic is now handled entirely inside spacy_model.py
+        # Initialize Modules
         self.spacy_analyzer = PiiSpacyAnalyzer()
+        self.inspector = ModelInspector()
 
     def list_patterns(self): return self.patterns
     def add_pattern(self, n, r): self.patterns[n.upper()] = r
     def remove_pattern(self, n): self.patterns.pop(n.upper(), None)
 
-    # --- 1. DETECTION LOGIC ---
+    # --- DETECTION ENGINES ---
+    def scan_with_regex(self, text: str) -> List[dict]:
+        matches = []
+        for label, regex in self.patterns.items():
+            for match in re.finditer(regex, text):
+                matches.append({"label": label, "text": match.group(), "start": match.start(), "end": match.end()})
+        return matches
+
     def scan_with_nltk(self, text: str) -> List[dict]:
         detections = []
         try:
@@ -92,27 +108,15 @@ class RegexClassifier:
         return detections
 
     def analyze_text_hybrid(self, text: str) -> List[dict]:
-        """Combines Regex, NLTK, and SpaCy results."""
         all_matches = []
-        
-        # 1. Regex Scan
-        for label, regex in self.patterns.items():
-            for match in re.finditer(regex, text):
-                all_matches.append({"label": label, "text": match.group(), "start": match.start(), "end": match.end()})
-        
-        # 2. NLTK Scan
+        all_matches.extend(self.scan_with_regex(text))
         all_matches.extend(self.scan_with_nltk(text))
-        
-        # 3. SpaCy Scan (Using the new module)
-        # Simply call the .scan() method of your new class
         all_matches.extend(self.spacy_analyzer.scan(text))
         
-        # Sort and Dedup (Logic remains the same)
         all_matches.sort(key=lambda x: x['start'])
         
         unique_matches = []
         if not all_matches: return []
-        
         curr = all_matches[0]
         for next_match in all_matches[1:]:
             if next_match['start'] < curr['end']:
@@ -122,10 +126,15 @@ class RegexClassifier:
                 unique_matches.append(curr)
                 curr = next_match
         unique_matches.append(curr)
-        
         return unique_matches
 
-    # --- 2. SUMMARY COUNTS ---
+    def run_full_inspection(self, text: str) -> pd.DataFrame:
+        r_matches = self.scan_with_regex(text)
+        n_matches = self.scan_with_nltk(text)
+        s_matches = self.spacy_analyzer.scan(text)
+        return self.inspector.compare_models(r_matches, n_matches, s_matches)
+
+    # --- SUMMARY & VISUALS ---
     def get_pii_counts(self, text: str) -> pd.DataFrame:
         matches = self.analyze_text_hybrid(str(text))
         if not matches: return pd.DataFrame(columns=["PII Type", "Count"])
@@ -137,7 +146,6 @@ class RegexClassifier:
         full_text = " ".join(df.astype(str).values.flatten())
         return self.get_pii_counts(full_text)
 
-    # --- 3. MASKING & VISUALS ---
     def mask_pii(self, text: str) -> str:
         text = str(text)
         matches = self.analyze_text_hybrid(text)
@@ -150,10 +158,8 @@ class RegexClassifier:
 
     def mask_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
         def safe_mask(val):
-            if isinstance(val, (list, dict, tuple, set)):
-                return self.mask_pii(str(val))
-            if pd.isna(val): 
-                return val
+            if isinstance(val, (list, dict, tuple, set)): return self.mask_pii(str(val))
+            if pd.isna(val): return val
             return self.mask_pii(str(val))
         return df.map(safe_mask)
 
@@ -185,15 +191,12 @@ class RegexClassifier:
                 tag = f'<span style="background-color: {color}; padding: 0 2px; border-radius: 3px; border: 1px solid #ccc;">{m["text"]}</span>'
                 text = text[:m['start']] + tag + text[m['end']:]
             return text
-        
         def safe_highlight(val):
              if isinstance(val, (list, dict)): return highlight_html(str(val))
              if pd.isna(val): return val
              return highlight_html(val)
-
         return df.map(safe_highlight)
 
-    # --- 4. SCHEMA DETECTION ---
     def get_data_schema(self, df: pd.DataFrame) -> pd.DataFrame:
         if df.empty: return pd.DataFrame(columns=["Column", "Type", "Sample"])
         schema_info = []
@@ -205,7 +208,7 @@ class RegexClassifier:
             schema_info.append({"Column Name": col, "Data Type": d_type, "Sample Value": sample_val})
         return pd.DataFrame(schema_info)
 
-    # --- 5. CONNECTORS (SQL) ---
+    # --- CONNECTORS ---
     def get_postgres_data(self, host, port, db, user, pw, table):
         safe_pw = quote_plus(pw)
         conn_str = f"postgresql://{user}:{safe_pw}@{host}:{port}/{db}"
@@ -218,7 +221,6 @@ class RegexClassifier:
         engine = create_engine(conn_str)
         return pd.read_sql(f"SELECT * FROM {table} LIMIT 100", engine)
 
-    # --- 6. MONGODB CONNECTOR ---
     def get_mongodb_data(self, host, port, db, user, pw, collection):
         if not MONGO_AVAILABLE: return pd.DataFrame()
         try:
@@ -241,7 +243,6 @@ class RegexClassifier:
             print(f"Mongo Error: {e}")
             raise e
 
-    # --- 7. DRIVE CONNECTOR ---
     def get_google_drive_files(self, credentials_dict):
         if not GOOGLE_AVAILABLE: return []
         try:
@@ -270,7 +271,44 @@ class RegexClassifier:
             return fh.getvalue()
         except: return b""
 
-    # --- 8. FILE READERS ---
+    # --- AWS S3 CONNECTORS (NEW) ---
+    def get_s3_buckets(self, access_key, secret_key, region):
+        """Lists all S3 buckets for the given credentials."""
+        if not AWS_AVAILABLE: return []
+        try:
+            s3 = boto3.client('s3', aws_access_key_id=access_key, 
+                              aws_secret_access_key=secret_key, region_name=region)
+            response = s3.list_buckets()
+            return [b['Name'] for b in response.get('Buckets', [])]
+        except Exception as e:
+            print(f"AWS S3 Bucket Error: {e}")
+            return []
+
+    def get_s3_files(self, access_key, secret_key, region, bucket_name):
+        """Lists files in a specific S3 bucket."""
+        if not AWS_AVAILABLE: return []
+        try:
+            s3 = boto3.client('s3', aws_access_key_id=access_key, 
+                              aws_secret_access_key=secret_key, region_name=region)
+            response = s3.list_objects_v2(Bucket=bucket_name)
+            return [obj['Key'] for obj in response.get('Contents', [])]
+        except Exception as e:
+            print(f"AWS S3 List Error: {e}")
+            return []
+
+    def download_s3_file(self, access_key, secret_key, region, bucket_name, file_key):
+        """Downloads a specific file from S3 to memory."""
+        if not AWS_AVAILABLE: return b""
+        try:
+            s3 = boto3.client('s3', aws_access_key_id=access_key, 
+                              aws_secret_access_key=secret_key, region_name=region)
+            obj = s3.get_object(Bucket=bucket_name, Key=file_key)
+            return obj['Body'].read()
+        except Exception as e:
+            print(f"AWS S3 Download Error: {e}")
+            return b""
+
+    # --- FILE READERS ---
     def get_json_data(self, file_obj) -> pd.DataFrame:
         data = json.load(file_obj)
         flat = []
