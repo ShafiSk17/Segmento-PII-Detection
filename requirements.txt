@@ -12,3 +12,6 @@ pymongo
 pyarrow
 spacy
 boto3
+presidio-analyzer
+azure-storage-blob
+google-cloud-storage

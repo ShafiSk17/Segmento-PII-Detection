@@ -11,6 +11,7 @@ from urllib.parse import quote_plus
 
 # --- IMPORT MODULES ---
 from spacy_model import PiiSpacyAnalyzer
+from presidio_model import PiiPresidioAnalyzer
 from inspector import ModelInspector
 
 # --- DEPENDENCY CHECKS ---
@@ -21,7 +22,7 @@ try:
     GOOGLE_AVAILABLE = True
 except ImportError:
     GOOGLE_AVAILABLE = False
-    print("Google Libraries not installed.")
+    print("Google Drive Libraries not installed.")
 
 try:
     import pymongo
@@ -37,14 +38,29 @@ except ImportError:
     PARQUET_AVAILABLE = False
     print("PyArrow not installed.")
 
-# --- AWS S3 IMPORT (NEW) ---
 try:
     import boto3
-    from botocore.exceptions import NoCredentialsError, ClientError
     AWS_AVAILABLE = True
 except ImportError:
     AWS_AVAILABLE = False
-    print("Boto3 not installed. AWS S3 features will fail.")
+    print("Boto3 not installed.")
+
+try:
+    from azure.storage.blob import BlobServiceClient
+    AZURE_AVAILABLE = True
+except ImportError:
+    AZURE_AVAILABLE = False
+    print("Azure Storage Blob not installed.")
+
+# --- GCP STORAGE IMPORT (NEW) ---
+try:
+    from google.cloud import storage
+    # We reuse google.oauth2.service_account if available, else import it
+    from google.oauth2 import service_account as gcp_service_account
+    GCS_AVAILABLE = True
+except ImportError:
+    GCS_AVAILABLE = False
+    print("Google Cloud Storage library not installed.")
 
 # --- NLTK SETUP ---
 try:
@@ -74,8 +90,8 @@ class RegexClassifier:
             "PAN_IND": r"\b[A-Z]{5}\d{4}[A-Z]{1}\b",
         }
 
-        # Initialize Modules
         self.spacy_analyzer = PiiSpacyAnalyzer()
+        self.presidio_analyzer = PiiPresidioAnalyzer()
         self.inspector = ModelInspector()
 
     def list_patterns(self): return self.patterns
@@ -112,6 +128,7 @@ class RegexClassifier:
         all_matches.extend(self.scan_with_regex(text))
         all_matches.extend(self.scan_with_nltk(text))
         all_matches.extend(self.spacy_analyzer.scan(text))
+        all_matches.extend(self.presidio_analyzer.scan(text))
         
         all_matches.sort(key=lambda x: x['start'])
         
@@ -132,7 +149,8 @@ class RegexClassifier:
         r_matches = self.scan_with_regex(text)
         n_matches = self.scan_with_nltk(text)
         s_matches = self.spacy_analyzer.scan(text)
-        return self.inspector.compare_models(r_matches, n_matches, s_matches)
+        p_matches = self.presidio_analyzer.scan(text)
+        return self.inspector.compare_models(r_matches, n_matches, s_matches, p_matches)
 
     # --- SUMMARY & VISUALS ---
     def get_pii_counts(self, text: str) -> pd.DataFrame:
@@ -208,7 +226,7 @@ class RegexClassifier:
             schema_info.append({"Column Name": col, "Data Type": d_type, "Sample Value": sample_val})
         return pd.DataFrame(schema_info)
 
-    # --- CONNECTORS ---
+    # --- SQL/MONGO/DRIVE/S3/AZURE CONNECTORS ---
     def get_postgres_data(self, host, port, db, user, pw, table):
         safe_pw = quote_plus(pw)
         conn_str = f"postgresql://{user}:{safe_pw}@{host}:{port}/{db}"
@@ -251,7 +269,6 @@ class RegexClassifier:
             service = build('drive', 'v3', credentials=creds)
             return service.files().list(pageSize=15, fields="files(id, name, mimeType)").execute().get('files', [])
         except Exception as e:
-            print(f"Drive Auth Error: {e}")
             return []
 
     def download_drive_file(self, file_id, mime_type, credentials_dict):
@@ -271,41 +288,104 @@ class RegexClassifier:
             return fh.getvalue()
         except: return b""
 
-    # --- AWS S3 CONNECTORS (NEW) ---
     def get_s3_buckets(self, access_key, secret_key, region):
-        """Lists all S3 buckets for the given credentials."""
         if not AWS_AVAILABLE: return []
         try:
-            s3 = boto3.client('s3', aws_access_key_id=access_key, 
-                              aws_secret_access_key=secret_key, region_name=region)
+            s3 = boto3.client('s3', aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name=region)
             response = s3.list_buckets()
             return [b['Name'] for b in response.get('Buckets', [])]
         except Exception as e:
-            print(f"AWS S3 Bucket Error: {e}")
+            print(f"S3 Error: {e}")
             return []
 
     def get_s3_files(self, access_key, secret_key, region, bucket_name):
-        """Lists files in a specific S3 bucket."""
         if not AWS_AVAILABLE: return []
         try:
-            s3 = boto3.client('s3', aws_access_key_id=access_key, 
-                              aws_secret_access_key=secret_key, region_name=region)
+            s3 = boto3.client('s3', aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name=region)
             response = s3.list_objects_v2(Bucket=bucket_name)
             return [obj['Key'] for obj in response.get('Contents', [])]
         except Exception as e:
-            print(f"AWS S3 List Error: {e}")
             return []
 
     def download_s3_file(self, access_key, secret_key, region, bucket_name, file_key):
-        """Downloads a specific file from S3 to memory."""
         if not AWS_AVAILABLE: return b""
         try:
-            s3 = boto3.client('s3', aws_access_key_id=access_key, 
-                              aws_secret_access_key=secret_key, region_name=region)
+            s3 = boto3.client('s3', aws_access_key_id=access_key, aws_secret_access_key=secret_key, region_name=region)
             obj = s3.get_object(Bucket=bucket_name, Key=file_key)
             return obj['Body'].read()
         except Exception as e:
-            print(f"AWS S3 Download Error: {e}")
+            return b""
+
+    def get_azure_containers(self, conn_str):
+        if not AZURE_AVAILABLE: return []
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+            containers = blob_service_client.list_containers()
+            return [c['name'] for c in containers]
+        except Exception as e:
+            print(f"Azure Error: {e}")
+            return []
+
+    def get_azure_blobs(self, conn_str, container_name):
+        if not AZURE_AVAILABLE: return []
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+            container_client = blob_service_client.get_container_client(container_name)
+            blobs = container_client.list_blobs()
+            return [b['name'] for b in blobs]
+        except Exception as e:
+            return []
+
+    def download_azure_blob(self, conn_str, container_name, blob_name):
+        if not AZURE_AVAILABLE: return b""
+        try:
+            blob_service_client = BlobServiceClient.from_connection_string(conn_str)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+            return blob_client.download_blob().readall()
+        except Exception as e:
+            return b""
+
+    # --- GCP BUCKET CONNECTORS (NEW) ---
+    def get_gcs_buckets(self, credentials_dict):
+        """Lists all GCS buckets for the given service account credentials."""
+        if not GCS_AVAILABLE: return []
+        try:
+            # Create credentials object
+            credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
+            # Create storage client
+            storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
+            
+            buckets = storage_client.list_buckets()
+            return [bucket.name for bucket in buckets]
+        except Exception as e:
+            print(f"GCP Bucket Error: {e}")
+            return []
+
+    def get_gcs_files(self, credentials_dict, bucket_name):
+        """Lists files (blobs) in a specific GCS bucket."""
+        if not GCS_AVAILABLE: return []
+        try:
+            credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
+            storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
+            
+            blobs = storage_client.list_blobs(bucket_name)
+            return [blob.name for blob in blobs]
+        except Exception as e:
+            print(f"GCP List Error: {e}")
+            return []
+
+    def download_gcs_file(self, credentials_dict, bucket_name, blob_name):
+        """Downloads a blob from GCS to memory."""
+        if not GCS_AVAILABLE: return b""
+        try:
+            credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
+            storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
+            
+            bucket = storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+            return blob.download_as_bytes()
+        except Exception as e:
+            print(f"GCP Download Error: {e}")
             return b""
 
     # --- FILE READERS ---
@@ -325,9 +405,7 @@ class RegexClassifier:
         if not PARQUET_AVAILABLE: return pd.DataFrame()
         try:
             return pd.read_parquet(io.BytesIO(file_bytes))
-        except Exception as e:
-            print(f"Parquet Read Error: {e}")
-            return pd.DataFrame()
+        except: return pd.DataFrame()
 
     def get_pdf_total_pages(self, file_bytes) -> int:
         try:
