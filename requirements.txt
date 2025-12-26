@@ -1,4 +1,6 @@
 pypdf
+pymupdf
+beautifulsoup4
 pandas
 streamlit
 nltk
@@ -15,3 +17,6 @@ boto3
 presidio-analyzer
 azure-storage-blob
 google-cloud-storage
+pytesseract
+Pillow
+fastavro

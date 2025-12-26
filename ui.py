@@ -1,3 +1,4 @@
+# ui.py
 import streamlit as st
 import pandas as pd
 import json
@@ -19,20 +20,24 @@ def main():
 
     classifier = st.session_state.classifier
 
+    # ================= SIDEBAR =================
     with st.sidebar:
         st.header("1. Source Selection")
-        main_category = st.selectbox("Select System", ["File System", "Databases", "Cloud Storage"])
+        main_category = st.selectbox("Select System", ["File System", "Databases", "Cloud Storage", "Email Services"])
         source = None
         file_sub_type = None
         
+        # --- FILE SYSTEM ---
         if main_category == "File System":
             struct_type = st.radio("Data Type", ["Structured Data", "Unstructured Data"])
             if struct_type == "Structured Data":
                 file_sub_type = st.selectbox("File Format", ["CSV", "JSON", "Parquet"])
             else:
-                file_sub_type = st.selectbox("File Format", ["PDF"])
+                # ADDED: "Image (OCR)" option
+                file_sub_type = st.selectbox("File Format", ["PDF", "Image (OCR)"])
             source = "File Upload"
 
+        # --- DATABASES ---
         elif main_category == "Databases":
             db_type = st.radio("Database Type", ["Relational (SQL)", "Non-Relational (NoSQL)"])
             if db_type == "Relational (SQL)":
@@ -42,8 +47,13 @@ def main():
                 db_icons = {"MongoDB": "🍃 MongoDB"}
                 source = st.selectbox("Select Database", ["MongoDB"], format_func=lambda x: db_icons.get(x))
 
+        # --- CLOUD STORAGE ---
         elif main_category == "Cloud Storage":
             source = st.selectbox("Service", ["Google Drive", "AWS S3", "Azure Blob Storage", "Google Cloud Storage"])
+
+        # --- EMAIL SERVICES ---
+        elif main_category == "Email Services":
+            source = st.radio("Provider", ["Gmail"])
 
         st.divider()
         st.header("2. Patterns")
@@ -67,6 +77,7 @@ def main():
                 classifier.remove_pattern(pattern_to_remove)
                 st.rerun()
 
+    # ================= HELPER FUNCTIONS =================
     def render_source_header(title, logo_url):
         col1, col2 = st.columns([0.1, 0.9])
         with col1:
@@ -118,14 +129,23 @@ def main():
         with c2:
             st.dataframe(count_df, hide_index=True, use_container_width=True)
 
+    # ================= MAIN LOGIC =================
     if source == "File Upload":
-        ext_map = {"PDF": ["pdf"], "CSV": ["csv"], "JSON": ["json"], "Parquet": ["parquet", "pqt"]}
+        # Updated extension map to include images
+        ext_map = {
+            "PDF": ["pdf"], 
+            "CSV": ["csv"], 
+            "JSON": ["json"], 
+            "Parquet": ["parquet", "pqt"],
+            "Image (OCR)": ["png", "jpg", "jpeg", "bmp", "tiff"]
+        }
         accepted_exts = ext_map.get(file_sub_type, [])
         st.subheader(f"📂 {file_sub_type} Analysis")
         uploaded_file = st.file_uploader(f"Upload {file_sub_type}", type=accepted_exts)
         
         if uploaded_file:
             mask_mode = st.checkbox("🔒 Enable PII Masking")
+            
             if file_sub_type == 'PDF':
                 file_bytes = uploaded_file.getvalue()
                 current_text = classifier.get_pdf_page_text(file_bytes, st.session_state.page_number)
@@ -143,6 +163,32 @@ def main():
                 st.markdown(f"**Viewing Page {st.session_state.page_number + 1} of {total_pages}**")
                 img = classifier.get_labeled_pdf_image(file_bytes, st.session_state.page_number)
                 if img: st.image(img, use_container_width=True)
+            
+            # --- NEW OCR LOGIC ---
+            elif file_sub_type == 'Image (OCR)':
+                file_bytes = uploaded_file.getvalue()
+                st.image(uploaded_file, caption="Uploaded Image", width=400)
+                
+                with st.spinner("⏳ Extracting text from image using OCR..."):
+                    extracted_text = classifier.get_ocr_text_from_image(file_bytes)
+                
+                if extracted_text and extracted_text.strip():
+                    st.success("Text extracted successfully!")
+                    
+                    # Convert to DataFrame for compatibility with existing helper functions
+                    df_res = pd.DataFrame({"Content": [extracted_text]})
+                    
+                    render_analytics(classifier.get_pii_counts_dataframe(df_res), df_res)
+                    render_inspector(extracted_text)
+                    
+                    st.subheader("📝 Extracted & Scanned Text")
+                    if mask_mode:
+                        st.dataframe(classifier.mask_dataframe(df_res))
+                    else:
+                        st.markdown(classifier.scan_dataframe_with_html(df_res).to_html(escape=False), unsafe_allow_html=True)
+                else:
+                    st.warning("No text could be extracted from this image.")
+
             else:
                 if file_sub_type == 'Parquet': df = classifier.get_parquet_data(uploaded_file.getvalue())
                 elif file_sub_type == 'CSV': df = pd.read_csv(uploaded_file)
@@ -210,8 +256,17 @@ def main():
                     if not content: st.error("Failed to read.")
                     else:
                         st.success(f"Scanning {selected_name}...")
-                        # Reuse scan logic ...
-                        # (omitted for brevity, same as S3)
+                        # Basic text scan support for Drive
+                        if isinstance(content, bytes):
+                             # Try decoding as utf-8 text first
+                            try:
+                                text_content = content.decode('utf-8')
+                                df_res = pd.DataFrame({"Content": [text_content]})
+                                render_analytics(classifier.get_pii_counts_dataframe(df_res), df_res)
+                                render_inspector(text_content)
+                                st.markdown(classifier.scan_dataframe_with_html(df_res).to_html(escape=False), unsafe_allow_html=True)
+                            except:
+                                st.warning("Binary file downloaded. PII scan currently supports text-based files from Drive.")
 
     elif source == "AWS S3":
         render_source_header("AWS S3 Import", "https://upload.wikimedia.org/wikipedia/commons/9/93/Amazon_Web_Services_Logo.svg")
@@ -239,11 +294,16 @@ def main():
                 if st.button("⬇️ Download & Scan"):
                     creds = st.session_state.aws_creds
                     file_content = classifier.download_s3_file(creds[0], creds[1], creds[2], selected_bucket, selected_file)
-                    # ... run scan logic ...
+                    # Simple csv support for demo
+                    try:
+                        df = pd.read_csv(io.BytesIO(file_content))
+                        render_analytics(classifier.get_pii_counts_dataframe(df), df)
+                        st.dataframe(classifier.mask_dataframe(df))
+                    except:
+                        st.error("Only CSV files supported for S3 demo.")
 
     elif source == "Azure Blob Storage":
         render_source_header("Azure Blob Storage Import", "https://upload.wikimedia.org/wikipedia/commons/f/fa/Microsoft_Azure.svg")
-        
         st.info("Get your Connection String from Azure Portal -> Storage Account -> Access keys.")
         conn_str = st.text_input("Connection String", type="password")
 
@@ -264,12 +324,16 @@ def main():
                 selected_blob = st.selectbox("Select Blob", st.session_state.azure_blobs)
                 if st.button("⬇️ Download & Scan"):
                     file_content = classifier.download_azure_blob(st.session_state.azure_conn, selected_container, selected_blob)
-                    # ... run scan logic ...
+                    try:
+                        df = pd.read_csv(io.BytesIO(file_content))
+                        render_analytics(classifier.get_pii_counts_dataframe(df), df)
+                        st.dataframe(classifier.mask_dataframe(df))
+                    except:
+                        st.error("Only CSV files supported for Azure demo.")
 
-    # --- GCP BUCKETS LOGIC (NEW) ---
+    # --- GCP BUCKETS LOGIC ---
     elif source == "Google Cloud Storage":
         render_source_header("Google Cloud Storage Import", "https://upload.wikimedia.org/wikipedia/commons/5/51/Google_Cloud_logo.svg")
-        
         st.info("Upload your GCP Service Account JSON key (must have Storage Object Viewer role).")
         gcp_creds_file = st.file_uploader("Upload service-account.json", type=['json'], key="gcp_upload")
         
@@ -297,16 +361,13 @@ def main():
                 
                 if st.button("⬇️ Download & Scan"):
                     file_content = classifier.download_gcs_file(st.session_state.gcp_creds, selected_bucket, selected_file)
-                    
                     if not file_content:
                         st.error("Failed to download file.")
                     else:
                         st.success(f"Scanning {selected_file}...")
                         mask_mode = st.checkbox("🔒 Mask Results", value=False, key="gcs_mask")
-                        
                         ext = selected_file.split('.')[-1].lower()
                         
-                        # Reuse Scan Logic (Same as AWS/Azure)
                         if ext == 'pdf':
                             text = classifier.get_pdf_page_text(file_content, 0)
                             render_analytics(classifier.get_pii_counts(text), None)
@@ -333,6 +394,40 @@ def main():
                             else: st.markdown(classifier.scan_dataframe_with_html(df).to_html(escape=False), unsafe_allow_html=True)
             elif 'gcs_files' in st.session_state:
                 st.warning("Bucket is empty.")
+
+    # --- GMAIL INTEGRATION ---
+    elif source == "Gmail":
+        render_source_header("Gmail Scanner", "https://upload.wikimedia.org/wikipedia/commons/7/7e/Gmail_icon_%282020%29.svg")
+        st.info("Upload your OAuth 2.0 Client Secret JSON (Desktop App).")
+        uploaded_file = st.file_uploader("Upload client_secret.json", type=['json'], key="gmail_secret")
+        num_emails = st.slider("Number of recent emails to scan", 5, 50, 10)
+        
+        if uploaded_file and st.button("Authenticate & Scan"):
+            with st.spinner("Authenticating and fetching emails... (Check browser for login window)"):
+                try:
+                    df = classifier.get_gmail_data(uploaded_file, num_emails)
+                    if not df.empty:
+                        st.success(f"Successfully fetched {len(df)} emails.")
+                        st.session_state.gmail_data = df
+                    else:
+                        st.error("No emails found or authentication failed.")
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+        if 'gmail_data' in st.session_state:
+            df = st.session_state.gmail_data
+            render_analytics(classifier.get_pii_counts_dataframe(df), df)
+            mask_mode = st.checkbox("🔒 Mask Results", value=False, key="gmail_mask")
+            if not df.empty:
+                sample_content = df.iloc[0]['Content']
+                st.markdown("### 📧 Sample Inspection (Most Recent Email)")
+                render_inspector(sample_content)
+
+            st.subheader("📬 Scanned Emails")
+            if mask_mode:
+                st.dataframe(classifier.mask_dataframe(df))
+            else:
+                st.markdown(classifier.scan_dataframe_with_html(df).to_html(escape=False), unsafe_allow_html=True)
 
 if __name__ == "__main__":
     main()

@@ -5,24 +5,31 @@ import pandas as pd
 import fitz  # PyMuPDF
 import nltk
 import io
+import os
+import pickle
+import base64
 from typing import Dict, List, Any
 from sqlalchemy import create_engine
 from urllib.parse import quote_plus
+from bs4 import BeautifulSoup 
 
 # --- IMPORT MODULES ---
 from spacy_model import PiiSpacyAnalyzer
 from presidio_model import PiiPresidioAnalyzer
 from inspector import ModelInspector
+from ocr_engine import OcrEngine  # <--- NEW IMPORT
 
 # --- DEPENDENCY CHECKS ---
 try:
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaIoBaseDownload
     from google.oauth2 import service_account
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
     GOOGLE_AVAILABLE = True
 except ImportError:
     GOOGLE_AVAILABLE = False
-    print("Google Drive Libraries not installed.")
+    print("Google Drive/Gmail Libraries not installed.")
 
 try:
     import pymongo
@@ -52,10 +59,9 @@ except ImportError:
     AZURE_AVAILABLE = False
     print("Azure Storage Blob not installed.")
 
-# --- GCP STORAGE IMPORT (NEW) ---
+# --- GCP STORAGE IMPORT ---
 try:
     from google.cloud import storage
-    # We reuse google.oauth2.service_account if available, else import it
     from google.oauth2 import service_account as gcp_service_account
     GCS_AVAILABLE = True
 except ImportError:
@@ -93,6 +99,7 @@ class RegexClassifier:
         self.spacy_analyzer = PiiSpacyAnalyzer()
         self.presidio_analyzer = PiiPresidioAnalyzer()
         self.inspector = ModelInspector()
+        self.ocr_engine = OcrEngine()  # <--- Initialize OCR
 
     def list_patterns(self): return self.patterns
     def add_pattern(self, n, r): self.patterns[n.upper()] = r
@@ -197,6 +204,11 @@ class RegexClassifier:
             return page.get_pixmap(matrix=fitz.Matrix(2, 2)).tobytes("png")
         except: return None
 
+    # --- OCR HELPERS (NEW) ---
+    def get_ocr_text_from_image(self, file_bytes) -> str:
+        """Runs OCR on image bytes and returns text."""
+        return self.ocr_engine.extract_text(file_bytes)
+
     def scan_dataframe_with_html(self, df: pd.DataFrame) -> pd.DataFrame:
         def highlight_html(text):
             text = str(text)
@@ -288,6 +300,70 @@ class RegexClassifier:
             return fh.getvalue()
         except: return b""
 
+    # --- GMAIL INTEGRATION ---
+    def get_gmail_data(self, credentials_file, num_emails=10) -> pd.DataFrame:
+        if not GOOGLE_AVAILABLE:
+            print("Google libraries not installed.")
+            return pd.DataFrame()
+
+        SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+        creds = None
+        token_path = 'token.pickle'
+        
+        if os.path.exists(token_path):
+            with open(token_path, 'rb') as token:
+                creds = pickle.load(token)
+        
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                with open("temp_client_secret.json", "wb") as f:
+                    f.write(credentials_file.getvalue())
+                
+                flow = InstalledAppFlow.from_client_secrets_file('temp_client_secret.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+                
+                with open(token_path, 'wb') as token:
+                    pickle.dump(creds, token)
+                
+                if os.path.exists("temp_client_secret.json"):
+                    os.remove("temp_client_secret.json")
+
+        service = build('gmail', 'v1', credentials=creds)
+        results = service.users().messages().list(userId='me', maxResults=num_emails).execute()
+        messages = results.get('messages', [])
+        
+        email_data = []
+
+        for message in messages:
+            msg = service.users().messages().get(userId='me', id=message['id']).execute()
+            payload = msg['payload']
+            headers = payload.get("headers")
+            
+            subject = next((h['value'] for h in headers if h['name'] == 'Subject'), "No Subject")
+            sender = next((h['value'] for h in headers if h['name'] == 'From'), "Unknown")
+
+            body = ""
+            if 'parts' in payload:
+                for part in payload['parts']:
+                    if part['mimeType'] == 'text/plain' and 'data' in part['body']:
+                        data = part['body']['data']
+                        body += base64.urlsafe_b64decode(data).decode()
+            elif 'body' in payload and 'data' in payload['body']:
+                 data = payload['body']['data']
+                 body += base64.urlsafe_b64decode(data).decode()
+
+            clean_body = BeautifulSoup(body, "html.parser").get_text()
+            email_data.append({
+                "Source": "Gmail",
+                "Sender": sender,
+                "Subject": subject,
+                "Content": f"Subject: {subject}\n\n{clean_body}"
+            })
+
+        return pd.DataFrame(email_data)
+
     def get_s3_buckets(self, access_key, secret_key, region):
         if not AWS_AVAILABLE: return []
         try:
@@ -345,16 +421,12 @@ class RegexClassifier:
         except Exception as e:
             return b""
 
-    # --- GCP BUCKET CONNECTORS (NEW) ---
+    # --- GCP BUCKET CONNECTORS ---
     def get_gcs_buckets(self, credentials_dict):
-        """Lists all GCS buckets for the given service account credentials."""
         if not GCS_AVAILABLE: return []
         try:
-            # Create credentials object
             credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
-            # Create storage client
             storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
-            
             buckets = storage_client.list_buckets()
             return [bucket.name for bucket in buckets]
         except Exception as e:
@@ -362,12 +434,10 @@ class RegexClassifier:
             return []
 
     def get_gcs_files(self, credentials_dict, bucket_name):
-        """Lists files (blobs) in a specific GCS bucket."""
         if not GCS_AVAILABLE: return []
         try:
             credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
             storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
-            
             blobs = storage_client.list_blobs(bucket_name)
             return [blob.name for blob in blobs]
         except Exception as e:
@@ -375,12 +445,10 @@ class RegexClassifier:
             return []
 
     def download_gcs_file(self, credentials_dict, bucket_name, blob_name):
-        """Downloads a blob from GCS to memory."""
         if not GCS_AVAILABLE: return b""
         try:
             credentials = gcp_service_account.Credentials.from_service_account_info(credentials_dict)
             storage_client = storage.Client(credentials=credentials, project=credentials_dict.get('project_id'))
-            
             bucket = storage_client.bucket(bucket_name)
             blob = bucket.blob(blob_name)
             return blob.download_as_bytes()
