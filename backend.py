@@ -17,7 +17,9 @@ from bs4 import BeautifulSoup
 from spacy_model import PiiSpacyAnalyzer
 from presidio_model import PiiPresidioAnalyzer
 from inspector import ModelInspector
-from ocr_engine import OcrEngine  # <--- NEW IMPORT
+from ocr_engine import OcrEngine 
+from avro_handler import AvroHandler
+from gliner_model import PiiGlinerAnalyzer # <--- GLiNER IMPORT
 
 # --- DEPENDENCY CHECKS ---
 try:
@@ -98,8 +100,10 @@ class RegexClassifier:
 
         self.spacy_analyzer = PiiSpacyAnalyzer()
         self.presidio_analyzer = PiiPresidioAnalyzer()
+        self.gliner_analyzer = PiiGlinerAnalyzer() # <--- Initialize GLiNER
         self.inspector = ModelInspector()
-        self.ocr_engine = OcrEngine()  # <--- Initialize OCR
+        self.ocr_engine = OcrEngine()
+        self.avro_handler = AvroHandler()
 
     def list_patterns(self): return self.patterns
     def add_pattern(self, n, r): self.patterns[n.upper()] = r
@@ -136,6 +140,7 @@ class RegexClassifier:
         all_matches.extend(self.scan_with_nltk(text))
         all_matches.extend(self.spacy_analyzer.scan(text))
         all_matches.extend(self.presidio_analyzer.scan(text))
+        all_matches.extend(self.gliner_analyzer.scan(text)) # <--- Add GLiNER results
         
         all_matches.sort(key=lambda x: x['start'])
         
@@ -157,7 +162,8 @@ class RegexClassifier:
         n_matches = self.scan_with_nltk(text)
         s_matches = self.spacy_analyzer.scan(text)
         p_matches = self.presidio_analyzer.scan(text)
-        return self.inspector.compare_models(r_matches, n_matches, s_matches, p_matches)
+        g_matches = self.gliner_analyzer.scan(text) # <--- Scan with GLiNER
+        return self.inspector.compare_models(r_matches, n_matches, s_matches, p_matches, g_matches) # <--- Pass to inspector
 
     # --- SUMMARY & VISUALS ---
     def get_pii_counts(self, text: str) -> pd.DataFrame:
@@ -204,10 +210,13 @@ class RegexClassifier:
             return page.get_pixmap(matrix=fitz.Matrix(2, 2)).tobytes("png")
         except: return None
 
-    # --- OCR HELPERS (NEW) ---
+    # --- OCR HELPERS ---
     def get_ocr_text_from_image(self, file_bytes) -> str:
-        """Runs OCR on image bytes and returns text."""
         return self.ocr_engine.extract_text(file_bytes)
+
+    # --- AVRO HELPER ---
+    def get_avro_data(self, file_bytes) -> pd.DataFrame:
+        return self.avro_handler.convert_to_dataframe(file_bytes)
 
     def scan_dataframe_with_html(self, df: pd.DataFrame) -> pd.DataFrame:
         def highlight_html(text):

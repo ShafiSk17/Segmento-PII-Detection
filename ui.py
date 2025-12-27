@@ -1,4 +1,3 @@
-# ui.py
 import streamlit as st
 import pandas as pd
 import json
@@ -15,8 +14,15 @@ def main():
     if 'page_number' not in st.session_state:
         st.session_state.page_number = 0
     
+    # ADDED: GLiNER to session state tracker so the Inspector graph works correctly
     if 'last_accuracy' not in st.session_state:
-        st.session_state.last_accuracy = {"🛠️ Regex": 0, "🧠 NLTK": 0, "🤖 SpaCy": 0, "🛡️ Presidio": 0}
+        st.session_state.last_accuracy = {
+            "🛠️ Regex": 0, 
+            "🧠 NLTK": 0, 
+            "🤖 SpaCy": 0, 
+            "🛡️ Presidio": 0, 
+            "🦅 GLiNER": 0  # <--- New Model
+        }
 
     classifier = st.session_state.classifier
 
@@ -31,9 +37,8 @@ def main():
         if main_category == "File System":
             struct_type = st.radio("Data Type", ["Structured Data", "Unstructured Data"])
             if struct_type == "Structured Data":
-                file_sub_type = st.selectbox("File Format", ["CSV", "JSON", "Parquet"])
+                file_sub_type = st.selectbox("File Format", ["CSV", "JSON", "Parquet", "Apache Avro"])
             else:
-                # ADDED: "Image (OCR)" option
                 file_sub_type = st.selectbox("File Format", ["PDF", "Image (OCR)"])
             source = "File Upload"
 
@@ -59,7 +64,7 @@ def main():
         st.header("2. Patterns")
         patterns = classifier.list_patterns()
         ordered_keys = ["EMAIL", "FIRST_NAME", "LAST_NAME", "PHONE", "SSN", "CREDIT_CARD"]
-        display_patterns = {k: patterns.get(k, "NLTK/SpaCy/Presidio") for k in ordered_keys if k in patterns or k in ["FIRST_NAME", "LAST_NAME"]}
+        display_patterns = {k: patterns.get(k, "NLTK/SpaCy/Presidio/GLiNER") for k in ordered_keys if k in patterns or k in ["FIRST_NAME", "LAST_NAME"]}
         for k, v in patterns.items():
             if k not in display_patterns: display_patterns[k] = v     
         st.dataframe(pd.DataFrame(list(display_patterns.items()), columns=["Name", "Regex/Method"]), hide_index=True)
@@ -90,15 +95,20 @@ def main():
         st.divider()
         st.markdown("### 🕵️ Inspector: Behind the Scenes")
         with st.expander("Show Detailed Model Performance", expanded=True):
+            # This calls backend -> inspector.compare_models (which now includes GLiNER)
             results_df = classifier.run_full_inspection(raw_text)
+            
             if results_df.empty:
                 st.info("No PII detected by any model.")
                 return
+            
             display_df = results_df[["Model", "Detected PII", "Missed PII"]]
             st.table(display_df)
+            
             col1, col2 = st.columns([2, 1])
             with col1:
                 st.markdown("**Model Accuracy Graph**")
+                # Visualization of accuracy including the new GLiNER model
                 fig = px.bar(results_df, x="Accuracy", y="Model", orientation='h', color="Model", text_auto='.2%', range_x=[0,1])
                 st.plotly_chart(fig, use_container_width=True)
             with col2:
@@ -109,6 +119,7 @@ def main():
                     last_acc = st.session_state.last_accuracy.get(model, 0)
                     delta = current_acc - last_acc
                     st.metric(label=model, value=f"{current_acc:.1%}", delta=f"{delta:.1%}")
+                    # Update session state for next run comparison
                     st.session_state.last_accuracy[model] = current_acc
 
     def render_analytics(count_df, source_df=None):
@@ -131,12 +142,12 @@ def main():
 
     # ================= MAIN LOGIC =================
     if source == "File Upload":
-        # Updated extension map to include images
         ext_map = {
             "PDF": ["pdf"], 
             "CSV": ["csv"], 
             "JSON": ["json"], 
             "Parquet": ["parquet", "pqt"],
+            "Apache Avro": ["avro"],
             "Image (OCR)": ["png", "jpg", "jpeg", "bmp", "tiff"]
         }
         accepted_exts = ext_map.get(file_sub_type, [])
@@ -164,7 +175,6 @@ def main():
                 img = classifier.get_labeled_pdf_image(file_bytes, st.session_state.page_number)
                 if img: st.image(img, use_container_width=True)
             
-            # --- NEW OCR LOGIC ---
             elif file_sub_type == 'Image (OCR)':
                 file_bytes = uploaded_file.getvalue()
                 st.image(uploaded_file, caption="Uploaded Image", width=400)
@@ -175,7 +185,6 @@ def main():
                 if extracted_text and extracted_text.strip():
                     st.success("Text extracted successfully!")
                     
-                    # Convert to DataFrame for compatibility with existing helper functions
                     df_res = pd.DataFrame({"Content": [extracted_text]})
                     
                     render_analytics(classifier.get_pii_counts_dataframe(df_res), df_res)
@@ -190,9 +199,15 @@ def main():
                     st.warning("No text could be extracted from this image.")
 
             else:
-                if file_sub_type == 'Parquet': df = classifier.get_parquet_data(uploaded_file.getvalue())
-                elif file_sub_type == 'CSV': df = pd.read_csv(uploaded_file)
-                else: df = classifier.get_json_data(uploaded_file) 
+                # Handle Structured Files (CSV, JSON, Parquet, Avro)
+                if file_sub_type == 'Parquet': 
+                    df = classifier.get_parquet_data(uploaded_file.getvalue())
+                elif file_sub_type == 'CSV': 
+                    df = pd.read_csv(uploaded_file)
+                elif file_sub_type == 'Apache Avro': 
+                    df = classifier.get_avro_data(uploaded_file.getvalue())
+                else: 
+                    df = classifier.get_json_data(uploaded_file) 
 
                 render_analytics(classifier.get_pii_counts_dataframe(df), df)
                 sample_text = df.head(10).to_string()
@@ -256,9 +271,7 @@ def main():
                     if not content: st.error("Failed to read.")
                     else:
                         st.success(f"Scanning {selected_name}...")
-                        # Basic text scan support for Drive
                         if isinstance(content, bytes):
-                             # Try decoding as utf-8 text first
                             try:
                                 text_content = content.decode('utf-8')
                                 df_res = pd.DataFrame({"Content": [text_content]})
@@ -294,7 +307,6 @@ def main():
                 if st.button("⬇️ Download & Scan"):
                     creds = st.session_state.aws_creds
                     file_content = classifier.download_s3_file(creds[0], creds[1], creds[2], selected_bucket, selected_file)
-                    # Simple csv support for demo
                     try:
                         df = pd.read_csv(io.BytesIO(file_content))
                         render_analytics(classifier.get_pii_counts_dataframe(df), df)
